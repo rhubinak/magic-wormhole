@@ -4,7 +4,9 @@ import hashlib
 import os
 import sys
 
+# from pathlib import Path
 import stat
+import tarfile
 import tempfile
 import zipfile
 
@@ -61,14 +63,16 @@ class Sender:
                 reactor,
                 self._args.launch_tor,
                 self._args.tor_control_port,
-                timing=self._timing)
+                timing=self._timing,
+            )
 
         w = create(
             self._args.appid or APPID,
             self._args.relay_url,
             self._reactor,
             tor=self._tor,
-            timing=self._timing)
+            timing=self._timing,
+        )
         d = self._go(w)
 
         # if we succeed, we should close and return the w.close results
@@ -99,8 +103,7 @@ class Sender:
     @inlineCallbacks
     def _go(self, w):
         welcome = yield w.get_welcome()
-        handle_welcome(welcome, self._args.relay_url, __version__,
-                       self._args.stderr)
+        handle_welcome(welcome, self._args.relay_url, __version__, self._args.stderr)
 
         # TODO: run the blocking zip-the-directory IO in a thread, let the
         # wormhole exchange happen in parallel
@@ -140,9 +143,7 @@ class Sender:
 
         # TODO: don't stall on w.get_verifier() unless they want it
         def on_slow_connection():
-            print(
-                u"Key established, waiting for confirmation...",
-                file=args.stderr)
+            print(u"Key established, waiting for confirmation...", file=args.stderr)
 
         notify = self._reactor.callLater(VERIFY_TIMER, on_slow_connection)
         try:
@@ -174,8 +175,7 @@ class Sender:
             d = Deferred()
             reactor.callLater(0.001, d.callback, None)
             yield d
-            self._check_verifier(w,
-                                 verifier_bytes)  # blocks, can TransferError
+            self._check_verifier(w, verifier_bytes)  # blocks, can TransferError
 
         if self._fd_to_send:
             ts = TransitSender(
@@ -183,7 +183,8 @@ class Sender:
                 no_listen=(not args.listen),
                 tor=self._tor,
                 reactor=self._reactor,
-                timing=self._timing)
+                timing=self._timing,
+            )
             self._transit_sender = ts
 
             # for now, send this before the main offer
@@ -202,8 +203,9 @@ class Sender:
             BUG339_APPID = u"lothar.com/wormhole/text-or-file-xfer"
 
             # TODO: move this down below w.get_message()
-            transit_key = w.derive_key(BUG339_APPID + "/transit-key",
-                                       ts.TRANSIT_KEY_LENGTH)
+            transit_key = w.derive_key(
+                BUG339_APPID + "/transit-key", ts.TRANSIT_KEY_LENGTH
+            )
             ts.set_transit_key(transit_key)
 
         self._send_data({"offer": offer}, w)
@@ -219,7 +221,8 @@ class Sender:
             recognized = False
             if u"error" in them_d:
                 raise TransferError(
-                    "remote error, transfer abandoned: %s" % them_d["error"])
+                    "remote error, transfer abandoned: %s" % them_d["error"]
+                )
             if u"transit" in them_d:
                 recognized = True
                 yield self._handle_transit(them_d[u"transit"])
@@ -231,7 +234,7 @@ class Sender:
                 yield self._handle_answer(them_d[u"answer"])
                 returnValue(None)
             if not recognized:
-                log.msg("unrecognized message %r" % (them_d, ))
+                log.msg("unrecognized message %r" % (them_d,))
 
     def _check_verifier(self, w, verifier_bytes):
         verifier = bytes_to_hexstr(verifier_bytes)
@@ -262,8 +265,8 @@ class Sender:
 
         if text is not None:
             print(
-                u"Sending text message (%s)" % naturalsize(len(text)),
-                file=args.stderr)
+                u"Sending text message (%s)" % naturalsize(len(text)), file=args.stderr
+            )
             offer = {"message": text}
             fd_to_send = None
             return offer, fd_to_send
@@ -314,8 +317,7 @@ class Sender:
 
         what = os.path.realpath(what)
         if not os.path.exists(what):
-            raise TransferError(
-                "Cannot send: no file/directory named '%s'" % args.what)
+            raise TransferError("Cannot send: no file/directory named '%s'" % args.what)
 
         if os.path.isfile(what):
             # we're sending a file
@@ -325,68 +327,102 @@ class Sender:
                 "filesize": filesize,
             }
             print(
-                u"Sending %s file named '%s'" % (naturalsize(filesize),
-                                                 basename),
-                file=args.stderr)
+                u"Sending %s file named '%s'" % (naturalsize(filesize), basename),
+                file=args.stderr,
+            )
             fd_to_send = open(what, "rb")
             return offer, fd_to_send
 
         if os.path.isdir(what):
             print(u"Building zipfile..", file=args.stderr)
+
+            # Get directory size
+            # root_directory = Path(what)
+            # data_len = sum(f.stat().st_size for f in root_directory.glob('**/*') if f.is_file())
+
             # We're sending a directory. Create a zipfile and send that
             # instead. SpooledTemporaryFile will use RAM until our size
             # threshold (10MB) is reached, then moves everything into a
             # tempdir (it tries $TMPDIR, $TEMP, $TMP, then platform-specific
             # paths like /tmp).
-            fd_to_send = tempfile.SpooledTemporaryFile(max_size=10*1000*1000)
-            # workaround for https://bugs.python.org/issue26175 (STF doesn't
+            fd_to_send = tempfile.SpooledTemporaryFile(max_size=10 * 1000 * 1000)
+
+            # Workaround for https://bugs.python.org/issue26175 (STF doesn't
             # fully implement IOBase abstract class), which breaks the new
             # zipfile in py3.7.0 that expects .seekable
             if not hasattr(fd_to_send, "seekable"):
                 # AFAICT all the filetypes that STF wraps can seek
                 fd_to_send.seekable = lambda: True
+
             num_files = 0
             num_bytes = 0
             tostrip = len(what.split(os.sep))
-            with zipfile.ZipFile(
-                    fd_to_send,
-                    "w",
-                    compression=zipfile.ZIP_DEFLATED,
-                    allowZip64=True) as zf:
-                for path, dirs, files in os.walk(what):
-                    # path always starts with args.what, then sometimes might
-                    # have "/subdir" appended. We want the zipfile to contain
-                    # "" or "subdir"
-                    localpath = list(path.split(os.sep)[tostrip:])
-                    for fn in files:
-                        archivename = os.path.join(*tuple(localpath + [fn]))
-                        localfilename = os.path.join(path, fn)
-                        try:
-                            zf.write(localfilename, archivename)
-                            num_bytes += os.stat(localfilename).st_size
-                            num_files += 1
-                        except OSError as e:
-                            errmsg = u"{}: {}".format(fn, e.strerror)
-                            if self._args.ignore_unsendable_files:
-                                print(
-                                    u"{} (ignoring error)".format(errmsg),
-                                    file=args.stderr)
-                            else:
-                                raise UnsendableFileError(errmsg)
+
+            if args.tar:
+                mode = "tar/archive"
+                with tarfile.open(fileobj=fd_to_send, mode="w") as tf:
+                    for path, dirs, files in os.walk(what):
+                        # path always starts with args.what, then sometimes might
+                        # have "/subdir" appended. We want the zipfile to contain
+                        # "" or "subdir"
+                        localpath = list(path.split(os.sep)[tostrip:])
+                        for fn in files:
+                            localfilename = os.path.join(path, fn)
+                            try:
+                                tf.add(localfilename)
+                                num_bytes += os.stat(localfilename).st_size
+                                num_files += 1
+                            except OSError as e:
+                                errmsg = u"{}: {}".format(fn, e.strerror)
+                                if self._args.ignore_unsendable_files:
+                                    print(
+                                        u"{} (ignoring error)".format(errmsg),
+                                        file=args.stderr,
+                                    )
+                                else:
+                                    raise UnsendableFileError(errmsg)
+            else:
+                mode = "zipfile/deflated"
+                with zipfile.ZipFile(
+                    fd_to_send, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
+                ) as zf:
+                    for path, dirs, files in os.walk(what):
+                        # path always starts with args.what, then sometimes might
+                        # have "/subdir" appended. We want the zipfile to contain
+                        # "" or "subdir"
+                        localpath = list(path.split(os.sep)[tostrip:])
+                        for fn in files:
+                            archivename = os.path.join(*tuple(localpath + [fn]))
+                            localfilename = os.path.join(path, fn)
+                            try:
+                                zf.write(localfilename, archivename)
+                                num_bytes += os.stat(localfilename).st_size
+                                num_files += 1
+                            except OSError as e:
+                                errmsg = u"{}: {}".format(fn, e.strerror)
+                                if self._args.ignore_unsendable_files:
+                                    print(
+                                        u"{} (ignoring error)".format(errmsg),
+                                        file=args.stderr,
+                                    )
+                                else:
+                                    raise UnsendableFileError(errmsg)
+
             fd_to_send.seek(0, 2)
             filesize = fd_to_send.tell()
             fd_to_send.seek(0, 0)
             offer["directory"] = {
-                "mode": "zipfile/deflated",
+                "mode": mode,
                 "dirname": basename,
                 "zipsize": filesize,
                 "numbytes": num_bytes,
                 "numfiles": num_files,
             }
             print(
-                u"Sending directory (%s compressed) named '%s'" %
-                (naturalsize(filesize), basename),
-                file=args.stderr)
+                u"Sending directory (%s compressed) named '%s'"
+                % (naturalsize(filesize), basename),
+                file=args.stderr,
+            )
             return offer, fd_to_send
 
         if stat.S_ISBLK(os.stat(what).st_mode):
@@ -398,9 +434,10 @@ class Sender:
                 "filesize": filesize,
             }
             print(
-                u"Sending %s block device named '%s'" % (naturalsize(filesize),
-                                                         basename),
-                file=args.stderr)
+                u"Sending %s block device named '%s'"
+                % (naturalsize(filesize), basename),
+                file=args.stderr,
+            )
 
             fd_to_send.seek(0)
             return offer, fd_to_send
@@ -413,11 +450,13 @@ class Sender:
             if them_answer["message_ack"] == "ok":
                 print(u"text message sent", file=self._args.stderr)
                 returnValue(None)  # terminates this function
-            raise TransferError("error sending text: %r" % (them_answer, ))
+            raise TransferError("error sending text: %r" % (them_answer,))
 
         if them_answer.get("file_ack") != "ok":
-            raise TransferError("ambiguous response from remote, "
-                                "transfer abandoned: %s" % (them_answer, ))
+            raise TransferError(
+                "ambiguous response from remote, "
+                "transfer abandoned: %s" % (them_answer,)
+            )
 
         yield self._send_file()
 
@@ -441,7 +480,8 @@ class Sender:
             disable=self._args.hide_progress,
             unit="B",
             unit_scale=True,
-            total=filesize)
+            total=filesize,
+        )
 
         def _count_and_hash(data):
             hasher.update(data)
@@ -455,9 +495,8 @@ class Sender:
                 if filesize:
                     # don't send zero-length files
                     yield fs.beginFileTransfer(
-                        self._fd_to_send,
-                        record_pipe,
-                        transform=_count_and_hash)
+                        self._fd_to_send, record_pipe, transform=_count_and_hash
+                    )
 
         expected_hash = hasher.digest()
         expected_hex = bytes_to_hexstr(expected_hash)

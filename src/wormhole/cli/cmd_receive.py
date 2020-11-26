@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
 import zipfile
 
@@ -17,8 +18,7 @@ from wormhole import __version__, create, input_with_completion
 
 from ..errors import TransferError
 from ..transit import TransitReceiver
-from ..util import (bytes_to_dict, bytes_to_hexstr, dict_to_bytes,
-                    estimate_free_space)
+from ..util import bytes_to_dict, bytes_to_hexstr, dict_to_bytes, estimate_free_space
 from .welcome import handle_welcome
 
 APPID = u"lothar.com/wormhole/text-or-file-xfer"
@@ -76,14 +76,16 @@ class Receiver:
                 self._reactor,
                 self.args.launch_tor,
                 self.args.tor_control_port,
-                timing=self.args.timing)
+                timing=self.args.timing,
+            )
 
         w = create(
             self.args.appid or APPID,
             self.args.relay_url,
             self._reactor,
             tor=self._tor,
-            timing=self.args.timing)
+            timing=self.args.timing,
+        )
         self._w = w  # so tests can wait on events too
 
         # I wanted to do this instead:
@@ -122,8 +124,7 @@ class Receiver:
     @inlineCallbacks
     def _go(self, w):
         welcome = yield w.get_welcome()
-        handle_welcome(welcome, self.args.relay_url, __version__,
-                       self.args.stderr)
+        handle_welcome(welcome, self.args.relay_url, __version__, self.args.stderr)
 
         yield self._handle_code(w)
 
@@ -146,8 +147,8 @@ class Receiver:
 
         def on_slow_verification():
             print(
-                u"Key established, waiting for confirmation...",
-                file=self.args.stderr)
+                u"Key established, waiting for confirmation...", file=self.args.stderr
+            )
 
         notify = self._reactor.callLater(VERIFY_TIMER, on_slow_verification)
         try:
@@ -190,7 +191,7 @@ class Receiver:
                     raise TransferError(r.response)
                 returnValue(None)
             if not recognized:
-                log.msg("unrecognized message %r" % (them_d, ))
+                log.msg("unrecognized message %r" % (them_d,))
 
     def _send_data(self, data, w):
         data_bytes = dict_to_bytes(data)
@@ -216,11 +217,13 @@ class Receiver:
         else:
             prompt = "Enter receive wormhole code: "
             used_completion = yield input_with_completion(
-                prompt, w.input_code(), self._reactor)
+                prompt, w.input_code(), self._reactor
+            )
             if not used_completion:
                 print(
                     " (note: you can use <Tab> to complete words)",
-                    file=self.args.stderr)
+                    file=self.args.stderr,
+                )
         yield w.get_code()
 
     def _show_verifier(self, verifier_bytes):
@@ -243,15 +246,17 @@ class Receiver:
             no_listen=(not self.args.listen),
             tor=self._tor,
             reactor=self._reactor,
-            timing=self.args.timing)
+            timing=self.args.timing,
+        )
         self._transit_receiver = tr
         # When I made it possible to override APPID with a CLI argument
         # (issue #113), I forgot to also change this w.derive_key() (issue
         # #339). We're stuck with it now. Use a local constant to make this
         # clear.
         BUG339_APPID = u"lothar.com/wormhole/text-or-file-xfer"
-        transit_key = w.derive_key(BUG339_APPID + u"/transit-key",
-                                   tr.TRANSIT_KEY_LENGTH)
+        transit_key = w.derive_key(
+            BUG339_APPID + u"/transit-key", tr.TRANSIT_KEY_LENGTH
+        )
         tr.set_transit_key(transit_key)
 
         tr.add_connection_hints(sender_transit.get("hints-v1", []))
@@ -282,11 +287,14 @@ class Receiver:
             self._send_permission(w)
             rp = yield self._establish_transit()
             datahash = yield self._transfer_data(rp, f)
-            self._write_directory(f)
+            if them_d["directory"]["mode"] == "zipfile/deflated":
+                self._write_directory_zip(f)
+            elif them_d["directory"]["mode"] == "tar/archive":
+                self._write_directory_tar(f)
             yield self._close_transit(rp, datahash)
         else:
             self._msg(u"I don't know what they're offering\n")
-            self._msg(u"Offer details: %r" % (them_d, ))
+            self._msg(u"Offer details: %r" % (them_d,))
             raise RespondError("unknown offer type")
 
     def _handle_text(self, them_d, w):
@@ -297,44 +305,48 @@ class Receiver:
 
     def _handle_file(self, them_d):
         file_data = them_d["file"]
-        self.abs_destname = self._decide_destname("file",
-                                                  file_data["filename"])
+        self.abs_destname = self._decide_destname("file", file_data["filename"])
         self.xfersize = file_data["filesize"]
         free = estimate_free_space(self.abs_destname)
         if free is not None and free < self.xfersize:
-            self._msg(u"Error: insufficient free space (%sB) for file (%sB)" %
-                      (free, self.xfersize))
+            self._msg(
+                u"Error: insufficient free space (%sB) for file (%sB)"
+                % (free, self.xfersize)
+            )
             raise TransferRejectedError()
 
-        self._msg(u"Receiving file (%s) into: %s" %
-                  (naturalsize(self.xfersize),
-                   os.path.basename(self.abs_destname)))
+        self._msg(
+            u"Receiving file (%s) into: %s"
+            % (naturalsize(self.xfersize), os.path.basename(self.abs_destname))
+        )
         self._ask_permission()
         tmp_destname = self.abs_destname + ".tmp"
         return open(tmp_destname, "wb")
 
     def _handle_directory(self, them_d):
         file_data = them_d["directory"]
-        zipmode = file_data["mode"]
-        if zipmode != "zipfile/deflated":
-            self._msg(u"Error: unknown directory-transfer mode '%s'" %
-                      (zipmode, ))
+        mode = file_data["mode"]
+        if mode not in ["zipfile/deflated", "tar/archive"]:
+            self._msg(u"Error: unknown directory-transfer mode '%s'" % (mode,))
             raise RespondError("unknown mode")
-        self.abs_destname = self._decide_destname("directory",
-                                                  file_data["dirname"])
+        self.abs_destname = self._decide_destname("directory", file_data["dirname"])
         self.xfersize = file_data["zipsize"]
         free = estimate_free_space(self.abs_destname)
         if free is not None and free < file_data["numbytes"]:
             self._msg(
-                u"Error: insufficient free space (%sB) for directory (%sB)" %
-                (free, file_data["numbytes"]))
+                u"Error: insufficient free space (%sB) for directory (%sB)"
+                % (free, file_data["numbytes"])
+            )
             raise TransferRejectedError()
 
-        self._msg(u"Receiving directory (%s) into: %s/" %
-                  (naturalsize(self.xfersize),
-                   os.path.basename(self.abs_destname)))
-        self._msg(u"%d files, %s (uncompressed)" %
-                  (file_data["numfiles"], naturalsize(file_data["numbytes"])))
+        self._msg(
+            u"Receiving directory (%s) into: %s/"
+            % (naturalsize(self.xfersize), os.path.basename(self.abs_destname))
+        )
+        self._msg(
+            u"%d files, %s (uncompressed)"
+            % (file_data["numfiles"], naturalsize(file_data["numbytes"]))
+        )
         self._ask_permission()
         f = tempfile.SpooledTemporaryFile()
         # workaround for https://bugs.python.org/issue26175 (STF doesn't
@@ -360,8 +372,7 @@ class Receiver:
                 if self.args.accept_file:
                     self._remove_existing(abs_destname)
             else:
-                self._msg(
-                    u"Error: refusing to overwrite existing '%s'" % destname)
+                self._msg(u"Error: refusing to overwrite existing '%s'" % destname)
                 raise TransferRejectedError()
         return abs_destname
 
@@ -404,11 +415,13 @@ class Receiver:
                 disable=self.args.hide_progress,
                 unit="B",
                 unit_scale=True,
-                total=self.xfersize)
+                total=self.xfersize,
+            )
             hasher = hashlib.sha256()
             with progress:
                 received = yield record_pipe.writeToFile(
-                    f, self.xfersize, progress.update, hasher.update)
+                    f, self.xfersize, progress.update, hasher.update
+                )
             datahash = hasher.digest()
 
         # except TransitError
@@ -424,8 +437,7 @@ class Receiver:
         tmp_name = f.name
         f.close()
         os.rename(tmp_name, self.abs_destname)
-        self._msg(u"Received file written to %s" % os.path.basename(
-            self.abs_destname))
+        self._msg(u"Received file written to %s" % os.path.basename(self.abs_destname))
 
     def _extract_file(self, zf, info, extract_dir):
         """
@@ -436,8 +448,9 @@ class Receiver:
         out_path = os.path.abspath(out_path)
         if not out_path.startswith(extract_dir):
             raise ValueError(
-                "malicious zipfile, %s outside of extract_dir %s" %
-                (info.filename, extract_dir))
+                "malicious zipfile, %s outside of extract_dir %s"
+                % (info.filename, extract_dir)
+            )
 
         zf.extract(info.filename, path=extract_dir)
 
@@ -445,7 +458,7 @@ class Receiver:
         perm = info.external_attr >> 16
         os.chmod(out_path, perm)
 
-    def _write_directory(self, f):
+    def _write_directory_zip(self, f):
 
         self._msg(u"Unpacking zipfile..")
         with self.args.timing.add("unpack zip"):
@@ -453,8 +466,21 @@ class Receiver:
                 for info in zf.infolist():
                     self._extract_file(zf, info, self.abs_destname)
 
-            self._msg(u"Received files written to %s/" % os.path.basename(
-                self.abs_destname))
+            self._msg(
+                u"Received files written to %s/" % os.path.basename(self.abs_destname)
+            )
+            f.close()
+
+    def _write_directory_tar(self, f):
+
+        self._msg(u"Unpacking tarfile..")
+        with self.args.timing.add("unpack tar"):
+            with tarfile.open(f) as tf:
+                tf.extractall(path=self.abs_destname)
+
+            self._msg(
+                u"Received files written to %s/" % os.path.basename(self.abs_destname)
+            )
             f.close()
 
     @inlineCallbacks
